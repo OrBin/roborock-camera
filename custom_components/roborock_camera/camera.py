@@ -8,6 +8,7 @@ the vacuum.
 import asyncio
 import json
 import logging
+import time
 from base64 import b64decode
 from dataclasses import dataclass, field
 from typing import Any
@@ -44,6 +45,31 @@ _ICE_POLL_ATTEMPTS = 20
 _ICE_POLL_DELAY = 0.25
 _TURN_POLL_ATTEMPTS = 8
 _VIDEO_QUALITY = "HD"
+_CLOUD_TIMEOUT = 4.0
+# After a cloud timeout, try the local route first for this long.
+_CLOUD_PENALTY = 120.0
+_SECRET_KEYS = {"password", "pwd", "user"}
+_SIGNAL_KEYS = {"app_sdp", "dev_sdp", "app_ice"}
+
+
+def _describe(value: Any) -> str:
+    """Summarize command params or results for the log without secrets."""
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            if key in _SECRET_KEYS:
+                parts.append(f"{key}=<redacted>")
+            elif key in _SIGNAL_KEYS and isinstance(item, str) and item != "retry":
+                parts.append(f"{key}=<{len(item)} chars>")
+            elif key == "dev_ice" and isinstance(item, list):
+                parts.append(f"dev_ice=<{len(item)} candidates>")
+            else:
+                parts.append(f"{key}={_describe(item)}")
+        return "{" + ", ".join(parts) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_describe(item) for item in value[:5]) + "]"
+    text = repr(value)
+    return text if len(text) <= 120 else text[:120] + "..."
 
 
 class _SessionSuperseded(Exception):
@@ -99,28 +125,31 @@ async def async_setup_entry(
 ) -> None:
     """Set up a camera for each vacuum that supports live video."""
     coordinators = config_entry.runtime_data
-    added = False
+    known: set[str] = set()
 
     @callback
     def async_add_coordinator_entities(
         coordinator: RoborockDataUpdateCoordinator,
     ) -> None:
-        """Add a camera when this vacuum reports live video support."""
-        nonlocal added
+        """Add a camera for each vacuum once.
+
+        Device features can still be empty right after a restart, so the
+        feature check is logged instead of used to skip the vacuum.
+        """
         if not isinstance(coordinator, RoborockDataUpdateCoordinator):
             return
-        if not _supports_live_video(coordinator):
+        if coordinator.duid in known:
             return
-        added = True
+        known.add(coordinator.duid)
+        _LOGGER.info(
+            "Adding Roborock camera for %s (live video reported: %s)",
+            coordinator.duid,
+            _supports_live_video(coordinator),
+        )
         async_add_entities([RoborockLiveCamera(coordinator, config_entry)])
 
     for coordinator in getattr(coordinators, "v1", []):
         async_add_coordinator_entities(coordinator)
-
-    if not added:
-        _LOGGER.warning(
-            "No vacuum on this Roborock account reported live video support"
-        )
 
     roborock_entry_id = config_entry.data[CONF_ROBOROCK_ENTRY_ID]
     config_entry.async_on_unload(
@@ -156,6 +185,7 @@ class RoborockLiveCamera(CoordinatorEntity[RoborockDataUpdateCoordinator], Camer
         self._negotiate_lock = asyncio.Lock()
         self._removed = False
         self._last_signal = "none"
+        self._cloud_bad_until = 0.0
 
     async def async_added_to_hass(self) -> None:
         """Fetch TURN credentials so the first viewer can relay media."""
@@ -359,23 +389,52 @@ class RoborockLiveCamera(CoordinatorEntity[RoborockDataUpdateCoordinator], Camer
         down, the local session is used instead of failing the stream.
         """
         api = self.coordinator.properties_api
-        senders: list[Any] = []
+        command_name = command.name if isinstance(command, RoborockCommand) else command
+        routes: list[tuple[str, Any]] = []
         mqtt_channel = getattr(api, "_mqtt_rpc_channel", None)
         if mqtt_channel is not None:
-            senders.append(mqtt_channel)
-        senders.append(api.command)
-        last_error: RoborockException | None = None
-        for sender in senders:
+            routes.append(("cloud", mqtt_channel))
+        routes.append(("local", api.command))
+        if len(routes) > 1 and time.monotonic() < self._cloud_bad_until:
+            routes.reverse()
+        last_error: Exception | None = None
+        for route, sender in routes:
+            started = time.monotonic()
             try:
-                if sender is api.command:
-                    return await sender.send(command, params=params)
-                return await sender.send_command(command, params=params)
-            except RoborockException as err:
+                if route == "local":
+                    result = await sender.send(command, params=params)
+                else:
+                    result = await asyncio.wait_for(
+                        sender.send_command(command, params=params), _CLOUD_TIMEOUT
+                    )
+            except (RoborockException, TimeoutError) as err:
                 last_error = err
+                if route == "cloud":
+                    self._cloud_bad_until = time.monotonic() + _CLOUD_PENALTY
+                _LOGGER.debug(
+                    "%s via %s failed after %.1fs: %r params=%s",
+                    command_name,
+                    route,
+                    time.monotonic() - started,
+                    err,
+                    _describe(params),
+                )
+                continue
+            if route == "cloud":
+                self._cloud_bad_until = 0.0
+            _LOGGER.debug(
+                "%s via %s in %.1fs: params=%s result=%s",
+                command_name,
+                route,
+                time.monotonic() - started,
+                _describe(params),
+                _describe(result),
+            )
+            return result
         try:
             assert last_error is not None
             raise last_error
-        except RoborockException as err:
+        except (RoborockException, TimeoutError) as err:
             command_name = (
                 command.name if isinstance(command, RoborockCommand) else command
             )

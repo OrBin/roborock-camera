@@ -23,9 +23,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.runtime_data = roborock_entry.runtime_data
 
     def _reload_when_roborock_unloads() -> None:
-        hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
+        if entry.state is ConfigEntryState.LOADED:
+            hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
 
-    entry.async_on_unload(roborock_entry.async_on_unload(_reload_when_roborock_unloads))
+    # ConfigEntry.async_on_unload returns None, so there is nothing to register.
+    roborock_entry.async_on_unload(_reload_when_roborock_unloads)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
