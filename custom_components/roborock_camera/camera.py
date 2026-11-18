@@ -257,6 +257,7 @@ class RoborockLiveCamera(CoordinatorEntity[RoborockDataUpdateCoordinator], Camer
         self, session_id: str, candidate: RTCIceCandidateInit
     ) -> None:
         """Forward a browser ICE candidate, or buffer it until the answer exists."""
+        _LOGGER.debug("Browser candidate: %s", candidate.candidate)
         session = self._sessions.get(session_id)
         if session is None or session.closed:
             return
@@ -268,6 +269,7 @@ class RoborockLiveCamera(CoordinatorEntity[RoborockDataUpdateCoordinator], Camer
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
         """Stop the preview when the browser leaves, including mid-negotiation."""
+        _LOGGER.debug("Browser closed session %s", session_id)
         session = self._sessions.get(session_id)
         if session is None:
             self._early_closes.add(session_id)
@@ -310,6 +312,7 @@ class RoborockLiveCamera(CoordinatorEntity[RoborockDataUpdateCoordinator], Camer
         session.preview_started = True
         self._raise_if_inactive(session_id, session)
         original_bytes = len(offer_sdp)
+        _LOGGER.debug("Browser offer for %s:\n%s", self.entity_id, offer_sdp)
         offer_sdp, inline_candidates = shrink_offer(offer_sdp)
         if len(offer_sdp) != original_bytes:
             _LOGGER.warning(
@@ -329,6 +332,7 @@ class RoborockLiveCamera(CoordinatorEntity[RoborockDataUpdateCoordinator], Camer
 
         session.ready = True
         _LOGGER.info("Received a camera answer from %s", self.entity_id)
+        _LOGGER.debug("Offer sent to %s:\n%s\nAnswer:\n%s", self.entity_id, offer_sdp, answer)
         session.send_message(WebRTCAnswer(answer))
         await self._forward_offer_candidates(inline_candidates)
         await self._async_refresh_turn(attempts=_TURN_POLL_ATTEMPTS)
@@ -546,6 +550,7 @@ class RoborockLiveCamera(CoordinatorEntity[RoborockDataUpdateCoordinator], Camer
         candidate = ice.get("candidate")
         if not isinstance(candidate, str):
             return
+        _LOGGER.debug("Vacuum candidate: %s", ice)
         sdp_m_line_index = ice.get("sdpMLineIndex")
         init_kwargs: dict[str, Any] = {
             "sdp_m_line_index": (
